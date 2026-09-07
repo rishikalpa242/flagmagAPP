@@ -1,10 +1,45 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { apiGet, apiPut } from "../lib/api";
+import { apiGet, apiPut, apiPost } from "../lib/api";
 import { formatTimePDT, formatDatePST } from "../lib/timeUtils";
+
+function useGameCountdown(date, time) {
+    const [msLeft, setMsLeft] = useState(null);
+
+    useEffect(() => {
+        if (!date || !time) return;
+        const [hStr, mStr] = time.split(":");
+        const h = parseInt(hStr, 10);
+        const m = parseInt(mStr, 10);
+        if (isNaN(h) || isNaN(m)) return;
+        // game.time is PDT (UTC-7); convert to UTC ms from midnight UTC of game.date
+        const gameStartMs = new Date(date).getTime() + (h + 7) * 3600000 + m * 60000;
+        const tick = () => setMsLeft(gameStartMs - Date.now());
+        tick();
+        const id = setInterval(tick, 1000);
+        return () => clearInterval(id);
+    }, [date, time]);
+
+    return msLeft;
+}
+
+function formatCountdown(ms) {
+    if (ms === null) return null;
+    if (ms <= 0) return "Starting soon";
+    const s = Math.floor(ms / 1000);
+    const days = Math.floor(s / 86400);
+    const hours = Math.floor((s % 86400) / 3600);
+    const mins = Math.floor((s % 3600) / 60);
+    const secs = s % 60;
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${mins}m`;
+    return `${mins}m ${secs}s`;
+}
+
+const MIN_PLAYERS_TO_START = 4;
 
 function isPlaceholderTeamName(name) {
     if (!name || !String(name).trim()) return true;
@@ -17,7 +52,7 @@ function isPlaceholderTeamName(name) {
     );
 }
 
-export default function MatchCard({ game, onStart }) {
+export default function MatchCard({ game, onStart, onGamesChanged }) {
     const [showConfirm, setShowConfirm] = useState(false);
     const [allTeams, setAllTeams] = useState([]);
     const [loadingTeams, setLoadingTeams] = useState(false);
@@ -25,12 +60,18 @@ export default function MatchCard({ game, onStart }) {
     const [teamBSelection, setTeamBSelection] = useState("");
     const [startError, setStartError] = useState("");
     const [starting, setStarting] = useState(false);
+    const [showResetFixtureConfirm, setShowResetFixtureConfirm] = useState(false);
+    const [resettingFixture, setResettingFixture] = useState(false);
+    const [resetFixtureError, setResetFixtureError] = useState("");
     const router = useRouter();
+    const msLeft = useGameCountdown(game.date, game.time);
+    const countdown = game.status === "upcoming" ? formatCountdown(msLeft) : null;
     const formatDate = (dateStr) => formatDatePST(dateStr);
     const formatTime = (timeStr) => formatTimePDT(timeStr);
     const needsTeamEdit =
         game.status === "upcoming" &&
         (isPlaceholderTeamName(game.teamA?.name) || isPlaceholderTeamName(game.teamB?.name));
+    const hasOriginalFixture = !!(game.originalTeamA?.name || game.originalTeamB?.name);
 
     const statusLabel = {
         upcoming: "Upcoming",
@@ -46,14 +87,17 @@ export default function MatchCard({ game, onStart }) {
             const res = await apiGet("/api/teams");
             const teams = Array.isArray(res.data) ? res.data : [];
             const realTeams = teams.filter((t) => !t.isPlaceholder && !isPlaceholderTeamName(t?.name));
-            setAllTeams(realTeams);
+            const leagueTeams = game.league
+                ? realTeams.filter((t) => (t.leagues || []).some((m) => String(m.league?._id || m.league || "") === String(game.league)))
+                : realTeams;
+            setAllTeams(leagueTeams);
 
-            const currentA = realTeams.find((t) => t?.name === game.teamA?.name);
-            const currentB = realTeams.find((t) => t?.name === game.teamB?.name);
+            const currentA = leagueTeams.find((t) => t?.name === game.teamA?.name);
+            const currentB = leagueTeams.find((t) => t?.name === game.teamB?.name);
             if (currentA?._id) setTeamASelection(String(currentA._id));
             if (currentB?._id) setTeamBSelection(String(currentB._id));
 
-            if (realTeams.length === 0) {
+            if (leagueTeams.length === 0) {
                 setStartError("No teams are available to assign for this game.");
             }
         } catch (err) {
@@ -108,6 +152,33 @@ export default function MatchCard({ game, onStart }) {
                 };
             }
 
+            // Both teams need a minimum roster before a game can be started.
+            // With placeholder teams being reassigned, check the freshly
+            // selected teams' own player lists (already loaded in allTeams)
+            // instead of the game's roster, which still reflects the old
+            // placeholder matchup at this point.
+            let countA, countB, nameA, nameB;
+            if (needsTeamEdit) {
+                const teamA = allTeams.find((t) => String(t._id) === teamASelection);
+                const teamB = allTeams.find((t) => String(t._id) === teamBSelection);
+                countA = (teamA?.players || []).length;
+                countB = (teamB?.players || []).length;
+                nameA = teamA?.name;
+                nameB = teamB?.name;
+            } else {
+                const rosterRes = await apiGet(`/api/games/${game._id}/roster`);
+                countA = (rosterRes.data?.teamA || []).length;
+                countB = (rosterRes.data?.teamB || []).length;
+                nameA = game.teamA?.name;
+                nameB = game.teamB?.name;
+            }
+            const shortTeams = [nameA && countA < MIN_PLAYERS_TO_START ? nameA : null, nameB && countB < MIN_PLAYERS_TO_START ? nameB : null].filter(Boolean);
+            if (shortTeams.length > 0) {
+                setStartError(`${shortTeams.join(" and ")} ${shortTeams.length > 1 ? "need" : "needs"} at least ${MIN_PLAYERS_TO_START} players before starting.`);
+                setStarting(false);
+                return;
+            }
+
             await apiPut(`/api/games/${game._id}`, payload);
             setShowConfirm(false);
             router.push(`/matches/${game._id}`);
@@ -115,6 +186,20 @@ export default function MatchCard({ game, onStart }) {
             setStartError(err.message || "Failed to start game");
         } finally {
             setStarting(false);
+        }
+    };
+
+    const handleResetFixture = async () => {
+        setResetFixtureError("");
+        setResettingFixture(true);
+        try {
+            await apiPost(`/api/games/${game._id}/reset-fixture`);
+            setShowResetFixtureConfirm(false);
+            onGamesChanged?.();
+        } catch (err) {
+            setResetFixtureError(err.message || "Failed to reset fixture");
+        } finally {
+            setResettingFixture(false);
         }
     };
 
@@ -165,6 +250,11 @@ export default function MatchCard({ game, onStart }) {
                         <li>
                             Time – <span>{formatDate(game.date)}{game.time ? `, ${formatTime(game.time)}` : ""}</span>
                         </li>
+                        {countdown && (
+                            <li>
+                                Starts In – <span className="countdown-timer">{countdown}</span>
+                            </li>
+                        )}
                         <li>
                             Location – <span>{game.location || "TBD"}</span>
                         </li>
@@ -180,6 +270,15 @@ export default function MatchCard({ game, onStart }) {
                             onClick={handleOpenStartModal}
                         >
                             Start Game
+                        </button>
+                    )}
+                    {game.status === "upcoming" && hasOriginalFixture && (
+                        <button
+                            className="btn btn-info-primary"
+                            style={{ marginLeft: 8 }}
+                            onClick={() => setShowResetFixtureConfirm(true)}
+                        >
+                            Reset Fixture
                         </button>
                     )}
                     {game.status === "in_progress" && (
@@ -267,6 +366,41 @@ export default function MatchCard({ game, onStart }) {
                                 disabled={loadingTeams || starting}
                             >
                                 {starting ? "Starting..." : "Yes, Start Game"}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {showResetFixtureConfirm && (
+                <div className="confirm-overlay" onClick={() => setShowResetFixtureConfirm(false)}>
+                    <div className="confirm-box" onClick={(e) => e.stopPropagation()}>
+                        <h4>Reset Fixture?</h4>
+                        <p>
+                            This will revert this game back to its original placeholder matchup:{" "}
+                            <strong>{game.originalTeamA?.name || game.teamA?.name}</strong> vs{" "}
+                            <strong>{game.originalTeamB?.name || game.teamB?.name}</strong>.
+                        </p>
+                        {resetFixtureError && (
+                            <p className="confirm-detail" style={{ color: "#ff5a5a" }}>{resetFixtureError}</p>
+                        )}
+                        <div className="confirm-actions">
+                            <button
+                                className="btn btn-secondary"
+                                onClick={() => {
+                                    setShowResetFixtureConfirm(false);
+                                    setResetFixtureError("");
+                                }}
+                                disabled={resettingFixture}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                className="btn btn-primary"
+                                onClick={handleResetFixture}
+                                disabled={resettingFixture}
+                            >
+                                {resettingFixture ? "Resetting..." : "Yes, Reset"}
                             </button>
                         </div>
                     </div>

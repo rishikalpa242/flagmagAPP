@@ -10,8 +10,9 @@ import MatchCard from "../components/MatchCard";
 
 const MATCH_TABS = [
     { key: "today", label: "Today" },
+    { key: "running", label: "Running" },
     { key: "upcoming", label: "Upcoming" },
-    { key: "incomplete", label: "Incomplete Games" },
+    { key: "incomplete", label: "Incomplete" },
     { key: "completed", label: "Completed" },
 ];
 
@@ -63,9 +64,15 @@ function MatchListContent() {
     // Filter games by tab + search + filters
     useEffect(() => {
         let filtered = [...games];
-        // Build today/tomorrow as UTC midnight so comparisons match game dates (stored as midnight UTC)
+        // Derive "today" in PDT/PST (America/Los_Angeles) so tab boundaries match the
+        // timezone shown to users — not UTC, which flips at 5 PM / 4 PM PDT/PST.
         const now = new Date();
-        const todayStr = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}-${String(now.getUTCDate()).padStart(2, "0")}`;
+        const todayStr = new Intl.DateTimeFormat("en-CA", {
+            timeZone: "America/Los_Angeles",
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+        }).format(now); // "YYYY-MM-DD" in LA time
         const today = new Date(todayStr + "T00:00:00Z");
         const tomorrow = new Date(today);
         tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
@@ -76,6 +83,8 @@ function MatchListContent() {
                 const d = new Date(g.date);
                 return d >= today && d < tomorrow;
             });
+        } else if (activeTab === "running") {
+            filtered = filtered.filter((g) => g.status === "in_progress");
         } else if (activeTab === "upcoming") {
             filtered = filtered.filter(
                 (g) => g.status === "upcoming" && new Date(g.date) >= tomorrow
@@ -243,6 +252,8 @@ function MatchListContent() {
                             <p>
                                 {activeTab === "today"
                                     ? "No games scheduled for today."
+                                    : activeTab === "running"
+                                    ? "No games currently running."
                                     : activeTab === "upcoming"
                                     ? "No upcoming games."
                                     : activeTab === "incomplete"
@@ -253,7 +264,7 @@ function MatchListContent() {
                     ) : (
                         <div className="match-box-wrap">
                             {filteredGames.map((game) => (
-                                <MatchCard key={game._id} game={game} />
+                                <MatchCard key={game._id} game={game} onGamesChanged={fetchGames} />
                             ))}
                         </div>
                     )}

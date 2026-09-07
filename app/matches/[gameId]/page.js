@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, use } from "react";
 import { useRouter } from "next/navigation";
 import { AuthProvider, useAuth } from "../../lib/AuthContext";
-import { apiGet, apiPost, apiPut } from "../../lib/api";
+import { apiGet, apiPost, apiPut, generateId } from "../../lib/api";
 import MobileHeader from "../../components/MobileHeader";
 import BottomFooter from "../../components/BottomFooter";
 import CompletionPage from "../../components/CompletionPage";
@@ -40,14 +40,84 @@ function LiveGameContent({ gameId }) {
     const [firstHalfSnapshot, setFirstHalfSnapshot] = useState(null); // { timeoutsA, timeoutsB, scoreA, scoreB, actionLog }
     const [showCancelConfirm, setShowCancelConfirm] = useState(false);
     const [showForfeitConfirm, setShowForfeitConfirm] = useState(false);
+    const [showNoStatsPrompt, setShowNoStatsPrompt] = useState(false);
+    const [forfeiting, setForfeiting] = useState(false);
+    // No Stats Game — "Yes" branch: pick a stand-in team to replace the
+    // forfeiting side so its real opponent can still rack up game reps/stats.
+    const [showSubstituteChoice, setShowSubstituteChoice] = useState(false);
+    const [showTeamPicker, setShowTeamPicker] = useState(false);
+    const [leagueTeams, setLeagueTeams] = useState([]);
+    const [loadingLeagueTeams, setLoadingLeagueTeams] = useState(false);
+    const [selectedSubTeamId, setSelectedSubTeamId] = useState("");
+    const [applyingSubstitute, setApplyingSubstitute] = useState(false);
     const [showCompleteConfirm, setShowCompleteConfirm] = useState(false);
     const [isPaused, setIsPaused] = useState(false);
+    const [showNavLockConfirm, setShowNavLockConfirm] = useState(false);
+
+    // A game being actively recorded must not be abandoned via refresh/back/nav.
+    // The statistician has to use Cancel Game / Forfeit / End Game instead.
+    const isLive = !!game && game.status === "in_progress";
 
     useEffect(() => {
         if (!authLoading && !user) {
             router.push("/login");
         }
     }, [authLoading, user, router]);
+
+    // Block browser refresh / tab close / typed-URL navigation while recording.
+    useEffect(() => {
+        if (!isLive) return undefined;
+        const handleBeforeUnload = (e) => {
+            e.preventDefault();
+            e.returnValue = "";
+            return "";
+        };
+        window.addEventListener("beforeunload", handleBeforeUnload);
+        return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+    }, [isLive]);
+
+    // Block the browser/gesture back button while recording by trapping history.
+    useEffect(() => {
+        if (!isLive) return undefined;
+        window.history.pushState({ gameLock: true }, "", window.location.href);
+        const handlePopState = () => {
+            // Re-trap immediately so the back navigation never actually completes.
+            window.history.pushState({ gameLock: true }, "", window.location.href);
+            setShowNavLockConfirm(true);
+        };
+        window.addEventListener("popstate", handlePopState);
+        return () => window.removeEventListener("popstate", handlePopState);
+    }, [isLive]);
+
+    // Disable mobile pull-to-refresh while recording. Safari largely ignores
+    // beforeunload confirmations for the pull-down-to-reload gesture, so the
+    // CSS hint alone isn't enough there — actively swallow the touch gesture
+    // that triggers it before Safari's native reload UI ever kicks in.
+    useEffect(() => {
+        if (!isLive) return undefined;
+        const previousOverscroll = document.body.style.overscrollBehaviorY;
+        document.body.style.overscrollBehaviorY = "contain";
+
+        let touchStartY = 0;
+        const handleTouchStart = (e) => {
+            touchStartY = e.touches[0].clientY;
+        };
+        const handleTouchMove = (e) => {
+            const scrollTop = window.scrollY || document.documentElement.scrollTop;
+            const pullingDownFromTop = scrollTop <= 0 && e.touches[0].clientY > touchStartY;
+            if (pullingDownFromTop) {
+                e.preventDefault();
+            }
+        };
+        document.addEventListener("touchstart", handleTouchStart, { passive: true });
+        document.addEventListener("touchmove", handleTouchMove, { passive: false });
+
+        return () => {
+            document.body.style.overscrollBehaviorY = previousOverscroll;
+            document.removeEventListener("touchstart", handleTouchStart);
+            document.removeEventListener("touchmove", handleTouchMove);
+        };
+    }, [isLive]);
 
     // Fetch game data
     const fetchGame = useCallback(async () => {
@@ -87,38 +157,78 @@ function LiveGameContent({ gameId }) {
         fetchRoster();
     }, [fetchGame, fetchStats, fetchRoster]);
 
-    // Load persisted plays into action log for completed/cancelled games
+    // Load persisted plays into action log on page load / refresh — runs once when game first loads
     useEffect(() => {
-        if (!game || (game.status !== "completed" && game.status !== "cancelled")) return;
+        if (!game) return;
+        const playTypeMap = {
+            completion: "Completion",
+            incomplete: "Incompletion",
+            interception: "Interception",
+            sack: "Sack",
+            fumble: "Fumble",
+            run: "Run",
+            timeout: "Timeout",
+        };
+        const toLog = (play) => ({
+            time: new Date(play.createdAt).toLocaleTimeString(),
+            action: playTypeMap[play.type] || play.type,
+            team: play.teamName || "",
+            half: play.half || "1st",
+            type: playTypeMap[play.type] || play.type,
+            activeTeam: play.activeTeam || "A",
+            playId: play._id?.toString(),
+            ptsAdded: play.ptsAdded || 0,
+            targetTeam: play.targetTeam || play.activeTeam || "A",
+            idempotencyKey: play.idempotencyKey || null,
+            data: {
+                passer: play.passer || "",
+                receiver: play.receiver || "",
+                rusher: play.rusher || "",
+                defender: play.defender || "",
+                flagPull: play.flagPull || "",
+                yards: play.yards || 0,
+                points: play.points || "",
+                safety: play.safety || false,
+            },
+        });
         const loadPlays = async () => {
             try {
                 const res = await apiGet(`/api/games/${gameId}/plays`);
-                if (res.data && res.data.length > 0) {
-                    const playTypeMap = { completion: "Completion", incomplete: "Incompletion", interception: "Interception", sack: "Sack", fumble: "Fumble", run: "Run" };
-                    const logs = res.data.map(play => ({
-                        time: new Date(play.createdAt).toLocaleTimeString(),
-                        action: playTypeMap[play.type] || play.type,
-                        team: play.teamName || "",
-                        half: play.half || "1st",
-                        type: playTypeMap[play.type] || play.type,
-                        activeTeam: play.activeTeam || "A",
-                        data: {
-                            passer: play.passer || "",
-                            receiver: play.receiver || "",
-                            rusher: play.rusher || "",
-                            defender: play.defender || "",
-                            flagPull: play.flagPull || "",
-                            yards: play.yards || 0,
-                            points: play.points || "",
-                            safety: play.safety || false,
-                        },
-                    })).reverse();
-                    setActionLog(logs);
+                if (!res.data || res.data.length === 0) return;
+                const allPlays = res.data; // oldest-first (API sorts createdAt: 1)
+                const firstHalfPlays = allPlays.filter(p => (p.half || "1st") === "1st");
+                const secondHalfPlays = allPlays.filter(p => p.half === "2nd");
+                const isInSecondHalf = game.firstHalfCompleted || secondHalfPlays.length > 0;
+                if (isInSecondHalf) {
+                    const h1TimeoutsA = firstHalfPlays.filter(p => p.type === "timeout" && p.activeTeam === "A").length;
+                    const h1TimeoutsB = firstHalfPlays.filter(p => p.type === "timeout" && p.activeTeam === "B").length;
+                    setFirstHalfSnapshot({
+                        timeoutsA: h1TimeoutsA,
+                        timeoutsB: h1TimeoutsB,
+                        scoreA: game.halfOneScoreA ?? 0,
+                        scoreB: game.halfOneScoreB ?? 0,
+                        actionLog: firstHalfPlays.map(toLog).reverse(),
+                    });
+                    setFirstHalfCompleted(true);
+                    setHalf("2nd");
+                    setViewingHalf("2nd");
+                    const h2TimeoutsA = secondHalfPlays.filter(p => p.type === "timeout" && p.activeTeam === "A").length;
+                    const h2TimeoutsB = secondHalfPlays.filter(p => p.type === "timeout" && p.activeTeam === "B").length;
+                    setTimeoutsA(h2TimeoutsA);
+                    setTimeoutsB(h2TimeoutsB);
+                    setActionLog(secondHalfPlays.map(toLog).reverse());
+                } else {
+                    const h1TimeoutsA = firstHalfPlays.filter(p => p.type === "timeout" && p.activeTeam === "A").length;
+                    const h1TimeoutsB = firstHalfPlays.filter(p => p.type === "timeout" && p.activeTeam === "B").length;
+                    setTimeoutsA(h1TimeoutsA);
+                    setTimeoutsB(h1TimeoutsB);
+                    setActionLog(allPlays.map(toLog).reverse());
                 }
             } catch { /* ignore */ }
         };
         loadPlays();
-    }, [game?.status, gameId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [game?._id, gameId]);
 
     const showToast = (message, type = "") => {
         setToast({ message, type });
@@ -136,54 +246,6 @@ function LiveGameContent({ gameId }) {
                 await apiPut(`/api/games/${gameId}`, { status: "completed" });
                 showToast("Game completed!", "success");
             }
-            fetchGame();
-        } catch (err) {
-            showToast(err.message, "error");
-        }
-    };
-
-    // Record a stat action
-    const recordAction = async (actionType) => {
-        const teamName = activeTeam === "A" ? game.teamA.name : game.teamB.name;
-        const logEntry = {
-            time: new Date().toLocaleTimeString(),
-            action: actionType,
-            team: teamName,
-            half,
-            round,
-            type: actionType,
-        };
-
-        setActionLog([logEntry, ...actionLog]);
-        showToast(`${actionType} recorded for ${teamName}`, "success");
-
-        // Update score for certain actions
-        if (actionType === "Touchdown") {
-            const scoreUpdate = {};
-            if (activeTeam === "A") {
-                scoreUpdate["teamA.score"] = (game.teamA.score || 0) + 6;
-            } else {
-                scoreUpdate["teamB.score"] = (game.teamB.score || 0) + 6;
-            }
-            try {
-                await apiPut(`/api/games/${gameId}`, scoreUpdate);
-                fetchGame();
-            } catch {
-                // ignore
-            }
-        }
-    };
-
-    // Update game score manually
-    const updateScore = async (team, delta) => {
-        if (!game) return;
-        const field = team === "A" ? "teamA" : "teamB";
-        const currentScore = game[field].score || 0;
-        const newScore = Math.max(0, currentScore + delta);
-        try {
-            await apiPut(`/api/games/${gameId}`, {
-                [`${field}.score`]: newScore,
-            });
             fetchGame();
         } catch (err) {
             showToast(err.message, "error");
@@ -215,6 +277,79 @@ function LiveGameContent({ gameId }) {
             } catch (err) {
                 showToast(err.message, "error");
             }
+        }
+    };
+
+    const loadLeagueTeams = async () => {
+        if (!game?.league || leagueTeams.length > 0 || loadingLeagueTeams) return;
+        setLoadingLeagueTeams(true);
+        try {
+            // /api/teams (not /api/leagues/[id]/teams) — statisticians aren't
+            // granted league-management permissions, only team/game/stats
+            // ones, so this is the one team-list endpoint they can actually
+            // call (same one MatchCard.js already relies on for this reason).
+            const res = await apiGet("/api/teams");
+            const teams = Array.isArray(res.data) ? res.data : [];
+            const inLeague = teams.filter(
+                (t) => !t.isPlaceholder && (t.leagues || []).some((m) => String(m.league?._id || m.league || "") === String(game.league))
+            );
+            setLeagueTeams(inLeague);
+        } catch (err) {
+            showToast(err.message || "Failed to load teams", "error");
+        } finally {
+            setLoadingLeagueTeams(false);
+        }
+    };
+
+    const openTeamPicker = () => {
+        setShowSubstituteChoice(false);
+        setShowTeamPicker(true);
+        loadLeagueTeams();
+    };
+
+    // "NO STATS placeholder" isn't specified/built yet.
+    const applyNoStatsPlaceholder = () => {
+        showToast("The NO STATS placeholder option isn't set up yet.", "error");
+    };
+
+    const closeSubstituteFlow = () => {
+        setShowSubstituteChoice(false);
+        setShowTeamPicker(false);
+        setSelectedSubTeamId("");
+    };
+
+    const forfeitedSideTeam = activeTeam === "A"
+        ? { name: game?.teamA?.name, logo: game?.teamA?.logo || "" }
+        : { name: game?.teamB?.name, logo: game?.teamB?.logo || "" };
+
+    const availableSubTeams = leagueTeams.filter(
+        (t) => t.name !== game?.teamA?.name && t.name !== game?.teamB?.name
+    );
+
+    // Replace the forfeiting side with the chosen stand-in and start the No
+    // Stats Game — the game plays out live so the real opponent gets stats,
+    // but Game.noStatsSide marks this side so its plays never count (see
+    // statsAggregation.js on the backend), and the score gets reverted/zeroed
+    // when the game is later completed.
+    const applySubstituteTeam = async () => {
+        const chosen = availableSubTeams.find((t) => String(t._id) === selectedSubTeamId);
+        if (!chosen) return;
+        const side = activeTeam;
+        setApplyingSubstitute(true);
+        try {
+            await apiPut(`/api/games/${gameId}`, {
+                status: "in_progress",
+                noStatsSide: side,
+                noStatsOriginalTeam: { name: forfeitedSideTeam.name, logo: forfeitedSideTeam.logo },
+                [side === "A" ? "teamA" : "teamB"]: { name: chosen.name, logo: chosen.logo || "", score: 0 },
+            });
+            showToast(`No Stats Game started against ${chosen.name}`, "success");
+            closeSubstituteFlow();
+            await fetchGame();
+        } catch (err) {
+            showToast(err.message || "Failed to schedule the No Stats Game", "error");
+        } finally {
+            setApplyingSubstitute(false);
         }
     };
 
@@ -257,7 +392,7 @@ function LiveGameContent({ gameId }) {
     const persistPlay = async (playType, logEntry, playData) => {
         try {
             const teamName = logEntry.team;
-            await apiPost(`/api/games/${gameId}/plays`, {
+            const res = await apiPost(`/api/games/${gameId}/plays`, {
                 type: playType,
                 activeTeam: logEntry.activeTeam,
                 teamName,
@@ -272,19 +407,52 @@ function LiveGameContent({ gameId }) {
                 safety: Boolean(playData.safety),
                 ptsAdded: logEntry.ptsAdded,
                 targetTeam: logEntry.targetTeam,
+                idempotencyKey: logEntry.idempotencyKey,
             });
+            return res.data?._id?.toString() || null;
         } catch (err) {
             console.error("Failed to persist play:", err);
+            // Show the server's actual reason (e.g. "no players on the
+            // roster", a validation error) instead of a generic message —
+            // callers below no longer show their own toast on failure, this
+            // is the one place that does, so it always reflects why it
+            // really failed.
+            showToast(err.message || "Failed to save — check connection and try again", "error");
+            return null;
+        }
+    };
+
+    const updatePlay = async (playId, playType, logEntry, playData) => {
+        if (!playId) return;
+        try {
+            await apiPut(`/api/games/${gameId}/plays?playId=${playId}`, {
+                type: playType,
+                activeTeam: logEntry.activeTeam,
+                teamName: logEntry.team,
+                half: logEntry.half,
+                passer: playData.passer || "",
+                receiver: playData.receiver || "",
+                rusher: playData.rusher || "",
+                defender: playData.defender || "",
+                flagPull: playData.flagPull || "",
+                yards: Number(playData.yards) || 0,
+                points: playData.points || "",
+                safety: Boolean(playData.safety),
+                ptsAdded: logEntry.ptsAdded,
+                targetTeam: logEntry.targetTeam,
+            });
+        } catch (err) {
+            console.error("Failed to update play:", err);
         }
     };
 
     const statActions = [
         { icon: "/assets/images/icon-completion.png", label: "Completion", action: "Completion" },
-        { icon: "/assets/images/icon-incompletion.png", label: "Incompletion", action: "Incompletion" },
-        { icon: "/assets/images/icon-interception.png", label: "Interception", action: "Interception" },
-        { icon: "/assets/images/icon-sack.png", label: "Sack", action: "Sack" },
-        { icon: "/assets/images/icon-qb.png", label: "Fumble", action: "Fumble" },
+        { icon: "/assets/images/inc_new.png", label: "Incompletion", action: "Incompletion" },
+        { icon: "/assets/images/sack_new.png", label: "Sack", action: "Sack" },
+        { icon: "/assets/images/int_new.png", label: "Interception", action: "Interception" },
         { icon: "/assets/images/icon-run.png", label: "Run", action: "Run" },
+        { icon: "/assets/images/fumble_new.png", label: "Fumble", action: "Fumble" },
     ];
 
     const getInitialData = (type) => {
@@ -313,21 +481,7 @@ function LiveGameContent({ gameId }) {
                     }
 
                     const targetTeam = activeTeam;
-                    let netDelta = ptsToAdd;
-                    
-                    if (editingLogIndex !== null) {
-                        const oldLog = actionLog[editingLogIndex];
-                        if (oldLog.targetTeam === targetTeam) {
-                            netDelta = ptsToAdd - oldLog.ptsAdded;
-                        } else {
-                            updateScore(oldLog.targetTeam, -oldLog.ptsAdded);
-                            netDelta = ptsToAdd;
-                        }
-                    }
-
-                    if (netDelta !== 0) {
-                        updateScore(targetTeam, netDelta);
-                    }
+                    const oldLog = editingLogIndex !== null ? actionLog[editingLogIndex] : null;
 
                     const teamName = activeTeam === "A" ? game.teamA.name : game.teamB.name;
                     const logDesc = `Compl ${data.yards}yd P${data.passer}-R${data.receiver}${data.flagPull ? ` FP:${data.flagPull}` : ''}`;
@@ -340,19 +494,37 @@ function LiveGameContent({ gameId }) {
                         activeTeam,
                         data,
                         ptsAdded: ptsToAdd,
-                        targetTeam
+                        targetTeam,
+                        idempotencyKey: editingLogIndex === null ? generateId() : oldLog?.idempotencyKey,
                     };
-                    
+
+                    // Score is derived server-side from ptsAdded/targetTeam via an
+                    // atomic increment on save — never computed here from local
+                    // score state, which is what let rapid-fire plays clobber
+                    // each other's points.
                     if (editingLogIndex !== null) {
                         const newLogs = [...actionLog];
                         newLogs[editingLogIndex] = { ...newLogs[editingLogIndex], ...logEntry };
                         setActionLog(newLogs);
+                        updatePlay(oldLog.playId, "completion", logEntry, data).then(fetchGame);
                         setEditingLogIndex(null);
                         showToast("Completion updated", "success");
                     } else {
                         setActionLog(prev => [logEntry, ...prev]);
-                        persistPlay("completion", logEntry, data);
-                        showToast("Completion saved", "success");
+                        persistPlay("completion", logEntry, data).then(playId => {
+                            if (playId) {
+                                setActionLog(prev => {
+                                    const next = [...prev];
+                                    const idx = next.findIndex(l => !l.playId && l.type === "Completion" && l.time === logEntry.time);
+                                    if (idx !== -1) next[idx] = { ...next[idx], playId };
+                                    return next;
+                                });
+                                showToast("Completion saved", "success");
+                            } else {
+                                setActionLog(prev => prev.filter(l => !(!l.playId && l.type === "Completion" && l.time === logEntry.time)));
+                            }
+                            fetchGame();
+                        });
                     }
                     setShowCompletionPage(false);
                 }}
@@ -384,19 +556,33 @@ function LiveGameContent({ gameId }) {
                         activeTeam,
                         data,
                         ptsAdded: 0,
-                        targetTeam: activeTeam
+                        targetTeam: activeTeam,
+                        idempotencyKey: editingLogIndex === null ? generateId() : oldLog?.idempotencyKey,
                     };
                     
                     if (editingLogIndex !== null) {
+                        const oldLog = actionLog[editingLogIndex];
                         const newLogs = [...actionLog];
                         newLogs[editingLogIndex] = { ...newLogs[editingLogIndex], ...logEntry };
                         setActionLog(newLogs);
+                        updatePlay(oldLog.playId, "incomplete", logEntry, data);
                         setEditingLogIndex(null);
                         showToast("Incompletion updated", "success");
                     } else {
                         setActionLog(prev => [logEntry, ...prev]);
-                        persistPlay("incomplete", logEntry, data);
-                        showToast("Incompletion saved", "success");
+                        persistPlay("incomplete", logEntry, data).then(playId => {
+                            if (playId) {
+                                setActionLog(prev => {
+                                    const next = [...prev];
+                                    const idx = next.findIndex(l => !l.playId && l.type === "Incompletion" && l.time === logEntry.time);
+                                    if (idx !== -1) next[idx] = { ...next[idx], playId };
+                                    return next;
+                                });
+                                showToast("Incompletion saved", "success");
+                            } else {
+                                setActionLog(prev => prev.filter(l => !(!l.playId && l.type === "Incompletion" && l.time === logEntry.time)));
+                            }
+                        });
                     }
                     setShowIncompletePassPage(false);
                 }}
@@ -426,21 +612,7 @@ function LiveGameContent({ gameId }) {
                     }
 
                     const targetTeam = activeTeam === "A" ? "B" : "A";
-                    let netDelta = ptsToAdd;
-
-                    if (editingLogIndex !== null) {
-                        const oldLog = actionLog[editingLogIndex];
-                        if (oldLog.targetTeam === targetTeam) {
-                            netDelta = ptsToAdd - oldLog.ptsAdded;
-                        } else {
-                            updateScore(oldLog.targetTeam, -oldLog.ptsAdded);
-                            netDelta = ptsToAdd;
-                        }
-                    }
-
-                    if (netDelta !== 0) {
-                        updateScore(targetTeam, netDelta);
-                    }
+                    const oldLog = editingLogIndex !== null ? actionLog[editingLogIndex] : null;
 
                     const teamName = activeTeam === "A" ? game.teamA.name : game.teamB.name;
                     const logDesc = `Fumble D${data.defender}${data.flagPull ? ` FP:${data.flagPull}` : ''}`;
@@ -453,19 +625,35 @@ function LiveGameContent({ gameId }) {
                         activeTeam,
                         data,
                         ptsAdded: ptsToAdd,
-                        targetTeam
+                        targetTeam,
+                        idempotencyKey: editingLogIndex === null ? generateId() : oldLog?.idempotencyKey,
                     };
-                    
+
+                    // Score is derived server-side from ptsAdded/targetTeam via an
+                    // atomic increment on save — see Completion's onSave for why.
                     if (editingLogIndex !== null) {
                         const newLogs = [...actionLog];
                         newLogs[editingLogIndex] = { ...newLogs[editingLogIndex], ...logEntry };
                         setActionLog(newLogs);
+                        updatePlay(oldLog.playId, "fumble", logEntry, data).then(fetchGame);
                         setEditingLogIndex(null);
                         showToast("Fumble updated", "success");
                     } else {
                         setActionLog(prev => [logEntry, ...prev]);
-                        persistPlay("fumble", logEntry, data);
-                        showToast("Fumble saved", "success");
+                        persistPlay("fumble", logEntry, data).then(playId => {
+                            if (playId) {
+                                setActionLog(prev => {
+                                    const next = [...prev];
+                                    const idx = next.findIndex(l => !l.playId && l.type === "Fumble" && l.time === logEntry.time);
+                                    if (idx !== -1) next[idx] = { ...next[idx], playId };
+                                    return next;
+                                });
+                                showToast("Fumble saved", "success");
+                            } else {
+                                setActionLog(prev => prev.filter(l => !(!l.playId && l.type === "Fumble" && l.time === logEntry.time)));
+                            }
+                            fetchGame();
+                        });
                     }
                     setShowFumblePage(false);
                 }}
@@ -495,21 +683,7 @@ function LiveGameContent({ gameId }) {
                     }
 
                     const targetTeam = activeTeam === "A" ? "B" : "A";
-                    let netDelta = ptsToAdd;
-
-                    if (editingLogIndex !== null) {
-                        const oldLog = actionLog[editingLogIndex];
-                        if (oldLog.targetTeam === targetTeam) {
-                            netDelta = ptsToAdd - oldLog.ptsAdded;
-                        } else {
-                            updateScore(oldLog.targetTeam, -oldLog.ptsAdded);
-                            netDelta = ptsToAdd;
-                        }
-                    }
-
-                    if (netDelta !== 0) {
-                        updateScore(targetTeam, netDelta);
-                    }
+                    const oldLog = editingLogIndex !== null ? actionLog[editingLogIndex] : null;
 
                     const teamName = activeTeam === "A" ? game.teamA.name : game.teamB.name;
                     const logDesc = `INT P${data.passer}-D${data.defender}${data.flagPull ? ` FP:${data.flagPull}` : ''}`;
@@ -522,19 +696,35 @@ function LiveGameContent({ gameId }) {
                         activeTeam,
                         data,
                         ptsAdded: ptsToAdd,
-                        targetTeam
+                        targetTeam,
+                        idempotencyKey: editingLogIndex === null ? generateId() : oldLog?.idempotencyKey,
                     };
-                    
+
+                    // Score is derived server-side from ptsAdded/targetTeam via an
+                    // atomic increment on save — see Completion's onSave for why.
                     if (editingLogIndex !== null) {
                         const newLogs = [...actionLog];
                         newLogs[editingLogIndex] = { ...newLogs[editingLogIndex], ...logEntry };
                         setActionLog(newLogs);
+                        updatePlay(oldLog.playId, "interception", logEntry, data).then(fetchGame);
                         setEditingLogIndex(null);
                         showToast("Interception updated", "success");
                     } else {
                         setActionLog(prev => [logEntry, ...prev]);
-                        persistPlay("interception", logEntry, data);
-                        showToast("Interception saved", "success");
+                        persistPlay("interception", logEntry, data).then(playId => {
+                            if (playId) {
+                                setActionLog(prev => {
+                                    const next = [...prev];
+                                    const idx = next.findIndex(l => !l.playId && l.type === "Interception" && l.time === logEntry.time);
+                                    if (idx !== -1) next[idx] = { ...next[idx], playId };
+                                    return next;
+                                });
+                                showToast("Interception saved", "success");
+                            } else {
+                                setActionLog(prev => prev.filter(l => !(!l.playId && l.type === "Interception" && l.time === logEntry.time)));
+                            }
+                            fetchGame();
+                        });
                     }
                     setShowInterceptionPage(false);
                 }}
@@ -559,21 +749,7 @@ function LiveGameContent({ gameId }) {
                     if (data.safety) ptsToAdd = 2;
 
                     const targetTeam = activeTeam === "A" ? "B" : "A";
-                    let netDelta = ptsToAdd;
-
-                    if (editingLogIndex !== null) {
-                        const oldLog = actionLog[editingLogIndex];
-                        if (oldLog.targetTeam === targetTeam) {
-                            netDelta = ptsToAdd - oldLog.ptsAdded;
-                        } else {
-                            updateScore(oldLog.targetTeam, -oldLog.ptsAdded);
-                            netDelta = ptsToAdd;
-                        }
-                    }
-
-                    if (netDelta !== 0) {
-                        updateScore(targetTeam, netDelta);
-                    }
+                    const oldLog = editingLogIndex !== null ? actionLog[editingLogIndex] : null;
 
                     const teamName = activeTeam === "A" ? game.teamA.name : game.teamB.name;
                     const logDesc = `Sack P${data.passer}-D${data.defender}${data.safety ? ' (Safety)' : ''}`;
@@ -586,19 +762,35 @@ function LiveGameContent({ gameId }) {
                         activeTeam,
                         data,
                         ptsAdded: ptsToAdd,
-                        targetTeam
+                        targetTeam,
+                        idempotencyKey: editingLogIndex === null ? generateId() : oldLog?.idempotencyKey,
                     };
-                    
+
+                    // Score is derived server-side from ptsAdded/targetTeam via an
+                    // atomic increment on save — see Completion's onSave for why.
                     if (editingLogIndex !== null) {
                         const newLogs = [...actionLog];
                         newLogs[editingLogIndex] = { ...newLogs[editingLogIndex], ...logEntry };
                         setActionLog(newLogs);
+                        updatePlay(oldLog.playId, "sack", logEntry, data).then(fetchGame);
                         setEditingLogIndex(null);
                         showToast("Sack updated", "success");
                     } else {
                         setActionLog(prev => [logEntry, ...prev]);
-                        persistPlay("sack", logEntry, data);
-                        showToast("Sack saved", "success");
+                        persistPlay("sack", logEntry, data).then(playId => {
+                            if (playId) {
+                                setActionLog(prev => {
+                                    const next = [...prev];
+                                    const idx = next.findIndex(l => !l.playId && l.type === "Sack" && l.time === logEntry.time);
+                                    if (idx !== -1) next[idx] = { ...next[idx], playId };
+                                    return next;
+                                });
+                                showToast("Sack saved", "success");
+                            } else {
+                                setActionLog(prev => prev.filter(l => !(!l.playId && l.type === "Sack" && l.time === logEntry.time)));
+                            }
+                            fetchGame();
+                        });
                     }
                     setShowSackPage(false);
                 }}
@@ -629,21 +821,7 @@ function LiveGameContent({ gameId }) {
                     }
 
                     const targetTeam = activeTeam;
-                    let netDelta = ptsToAdd;
-
-                    if (editingLogIndex !== null) {
-                        const oldLog = actionLog[editingLogIndex];
-                        if (oldLog.targetTeam === targetTeam) {
-                            netDelta = ptsToAdd - oldLog.ptsAdded;
-                        } else {
-                            updateScore(oldLog.targetTeam, -oldLog.ptsAdded);
-                            netDelta = ptsToAdd;
-                        }
-                    }
-
-                    if (netDelta !== 0) {
-                        updateScore(targetTeam, netDelta);
-                    }
+                    const oldLog = editingLogIndex !== null ? actionLog[editingLogIndex] : null;
 
                     const teamName = activeTeam === "A" ? game.teamA.name : game.teamB.name;
                     const logDesc = `Run ${data.yards}yd R${data.rusher}${data.flagPull ? ` FP:${data.flagPull}` : ''}`;
@@ -656,19 +834,35 @@ function LiveGameContent({ gameId }) {
                         activeTeam,
                         data,
                         ptsAdded: ptsToAdd,
-                        targetTeam
+                        targetTeam,
+                        idempotencyKey: editingLogIndex === null ? generateId() : oldLog?.idempotencyKey,
                     };
-                    
+
+                    // Score is derived server-side from ptsAdded/targetTeam via an
+                    // atomic increment on save — see Completion's onSave for why.
                     if (editingLogIndex !== null) {
                         const newLogs = [...actionLog];
                         newLogs[editingLogIndex] = { ...newLogs[editingLogIndex], ...logEntry };
                         setActionLog(newLogs);
+                        updatePlay(oldLog.playId, "run", logEntry, data).then(fetchGame);
                         setEditingLogIndex(null);
                         showToast("Run updated", "success");
                     } else {
                         setActionLog(prev => [logEntry, ...prev]);
-                        persistPlay("run", logEntry, data);
-                        showToast("Run saved", "success");
+                        persistPlay("run", logEntry, data).then(playId => {
+                            if (playId) {
+                                setActionLog(prev => {
+                                    const next = [...prev];
+                                    const idx = next.findIndex(l => !l.playId && l.type === "Run" && l.time === logEntry.time);
+                                    if (idx !== -1) next[idx] = { ...next[idx], playId };
+                                    return next;
+                                });
+                                showToast("Run saved", "success");
+                            } else {
+                                setActionLog(prev => prev.filter(l => !(!l.playId && l.type === "Run" && l.time === logEntry.time)));
+                            }
+                            fetchGame();
+                        });
                     }
                     setShowRunPage(false);
                 }}
@@ -685,31 +879,52 @@ function LiveGameContent({ gameId }) {
             <div className="main-section-wrapper" style={{ alignItems: "flex-start", paddingBottom: 80 }}>
                 {toast && <div className={`toast-message ${toast.type}`}>{toast.message}</div>}
 
-                <MobileHeader />
+                <MobileHeader
+                    navLocked={isLive}
+                    onNavLockedAttempt={() => setShowNavLockConfirm(true)}
+                />
+
+                {/* Navigation locked while recording a live game */}
+                {showNavLockConfirm && (
+                    <div className="confirm-overlay" onClick={() => setShowNavLockConfirm(false)}>
+                        <div className="confirm-box" onClick={(e) => e.stopPropagation()}>
+                            <h4>Game In Progress</h4>
+                            <p>You can&apos;t leave this page while recording a live game.</p>
+                            <p className="confirm-detail">
+                                Use Cancel Game, Forfeit, or End Game below to exit properly.
+                            </p>
+                            <div className="confirm-actions">
+                                <button className="btn btn-primary" onClick={() => setShowNavLockConfirm(false)}>
+                                    Got It
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
 
                 {/* Live match score */}
                 <div className="live-match-wrapper">
                     <div className="top">
-                        <div
-                            className={`team-box ${activeTeam === "A" ? "active" : ""}`}
-                            onClick={() => {
-                                if (isPaused) { showToast("Resume the game first", "error"); return; }
-                                setActiveTeam("A");
-                            }}
-                            style={{
-                                cursor: "pointer",
-                            }}
-                        >
-                            <h5>{game.teamA?.name || "Team A"}</h5>
-                            <div className="image-area">
-                                <img
-                                    src={game.teamA?.logo || "/assets/images/team-placeholder.svg"}
-                                    alt={game.teamA?.name}
-                                />
+                        {/* Team A column — selector box + timeout below it */}
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", flex: 1, gap: 10 }}>
+                            <div
+                                className={`team-box ${activeTeam === "A" ? "active" : ""}`}
+                                onClick={() => {
+                                    if (isPaused) { showToast("Resume the game first", "error"); return; }
+                                    setActiveTeam("A");
+                                }}
+                                style={{ cursor: "pointer", width: "100%" }}
+                            >
+                                <h5>{game.teamA?.name || "Team A"}</h5>
+                                <div className="image-area">
+                                    <img
+                                        src={game.teamA?.logo || "/assets/images/team-placeholder.svg"}
+                                        alt={game.teamA?.name}
+                                    />
+                                </div>
                             </div>
-                            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 8 }}>
-                                <span style={{ color: "#ccc", fontSize: 12 }}>TO: {displayTimeoutsA}/3</span>
-                                {!isViewOnly && (
+                            <span style={{ color: "#ccc", fontSize: 12, fontWeight: 600, letterSpacing: 1 }}>TO: {displayTimeoutsA}/3</span>
+                            {!isViewOnly && (
                                 <button
                                     onClick={(e) => {
                                         e.stopPropagation();
@@ -722,25 +937,36 @@ function LiveGameContent({ gameId }) {
                                                 action: "Timeout",
                                                 team: game.teamA?.name,
                                                 half,
+                                                type: "Timeout",
+                                                activeTeam: "A",
+                                                data: {},
                                             };
                                             setActionLog(prev => [logEntry, ...prev]);
+                                            apiPost(`/api/games/${gameId}/plays`, {
+                                                type: "timeout",
+                                                activeTeam: "A",
+                                                teamName: game.teamA?.name,
+                                                half,
+                                            }).catch(() => {});
                                             showToast(`Timeout taken by ${game.teamA?.name} (${timeoutsA + 1}/3 this half)`, "success");
                                         } else {
                                             showToast(`${game.teamA?.name} has no timeouts left this half`, "error");
                                         }
                                     }}
                                     style={{
-                                        width: 24, height: 24, borderRadius: "50%",
-                                        background: (isPaused || timeoutsA >= 3) ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.15)",
-                                        color: (isPaused || timeoutsA >= 3) ? "#555" : "#fff",
-                                        display: "flex", alignItems: "center", justifyContent: "center",
-                                        fontSize: 16, border: "none", cursor: (isPaused || timeoutsA >= 3) ? "not-allowed" : "pointer",
+                                        padding: "8px 16px",
+                                        borderRadius: 20,
+                                        background: (isPaused || timeoutsA >= 3) ? "rgba(255,255,255,0.05)" : "rgba(255,100,30,0.25)",
+                                        color: (isPaused || timeoutsA >= 3) ? "#555" : "#ff8040",
+                                        border: `1.5px solid ${(isPaused || timeoutsA >= 3) ? "rgba(255,255,255,0.08)" : "rgba(255,120,40,0.5)"}`,
+                                        fontSize: 12, fontWeight: 700, letterSpacing: 1,
+                                        cursor: (isPaused || timeoutsA >= 3) ? "not-allowed" : "pointer",
+                                        whiteSpace: "nowrap",
                                     }}
                                 >
-                                    +
+                                    TIMEOUT
                                 </button>
-                                )}
-                            </div>
+                            )}
                         </div>
 
                         <div className="team-score">
@@ -750,26 +976,26 @@ function LiveGameContent({ gameId }) {
                             <h6>Score</h6>
                         </div>
 
-                        <div
-                            className={`team-box ${activeTeam === "B" ? "active" : ""}`}
-                            onClick={() => {
-                                if (isPaused) { showToast("Resume the game first", "error"); return; }
-                                setActiveTeam("B");
-                            }}
-                            style={{
-                                cursor: "pointer",
-                            }}
-                        >
-                            <h5>{game.teamB?.name || "Team B"}</h5>
-                            <div className="image-area">
-                                <img
-                                    src={game.teamB?.logo || "/assets/images/team-placeholder.svg"}
-                                    alt={game.teamB?.name}
-                                />
+                        {/* Team B column — selector box + timeout below it */}
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", flex: 1, gap: 10 }}>
+                            <div
+                                className={`team-box ${activeTeam === "B" ? "active" : ""}`}
+                                onClick={() => {
+                                    if (isPaused) { showToast("Resume the game first", "error"); return; }
+                                    setActiveTeam("B");
+                                }}
+                                style={{ cursor: "pointer", width: "100%" }}
+                            >
+                                <h5>{game.teamB?.name || "Team B"}</h5>
+                                <div className="image-area">
+                                    <img
+                                        src={game.teamB?.logo || "/assets/images/team-placeholder.svg"}
+                                        alt={game.teamB?.name}
+                                    />
+                                </div>
                             </div>
-                            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, marginTop: 8 }}>
-                                <span style={{ color: "#ccc", fontSize: 12 }}>TO: {displayTimeoutsB}/3</span>
-                                {!isViewOnly && (
+                            <span style={{ color: "#ccc", fontSize: 12, fontWeight: 600, letterSpacing: 1 }}>TO: {displayTimeoutsB}/3</span>
+                            {!isViewOnly && (
                                 <button
                                     onClick={(e) => {
                                         e.stopPropagation();
@@ -782,25 +1008,36 @@ function LiveGameContent({ gameId }) {
                                                 action: "Timeout",
                                                 team: game.teamB?.name,
                                                 half,
+                                                type: "Timeout",
+                                                activeTeam: "B",
+                                                data: {},
                                             };
                                             setActionLog(prev => [logEntry, ...prev]);
+                                            apiPost(`/api/games/${gameId}/plays`, {
+                                                type: "timeout",
+                                                activeTeam: "B",
+                                                teamName: game.teamB?.name,
+                                                half,
+                                            }).catch(() => {});
                                             showToast(`Timeout taken by ${game.teamB?.name} (${timeoutsB + 1}/3 this half)`, "success");
                                         } else {
                                             showToast(`${game.teamB?.name} has no timeouts left this half`, "error");
                                         }
                                     }}
                                     style={{
-                                        width: 24, height: 24, borderRadius: "50%",
-                                        background: (isPaused || timeoutsB >= 3) ? "rgba(255,255,255,0.05)" : "rgba(255,255,255,0.15)",
-                                        color: (isPaused || timeoutsB >= 3) ? "#555" : "#fff",
-                                        display: "flex", alignItems: "center", justifyContent: "center",
-                                        fontSize: 16, border: "none", cursor: (isPaused || timeoutsB >= 3) ? "not-allowed" : "pointer",
+                                        padding: "8px 16px",
+                                        borderRadius: 20,
+                                        background: (isPaused || timeoutsB >= 3) ? "rgba(255,255,255,0.05)" : "rgba(255,100,30,0.25)",
+                                        color: (isPaused || timeoutsB >= 3) ? "#555" : "#ff8040",
+                                        border: `1.5px solid ${(isPaused || timeoutsB >= 3) ? "rgba(255,255,255,0.08)" : "rgba(255,120,40,0.5)"}`,
+                                        fontSize: 12, fontWeight: 700, letterSpacing: 1,
+                                        cursor: (isPaused || timeoutsB >= 3) ? "not-allowed" : "pointer",
+                                        whiteSpace: "nowrap",
                                     }}
                                 >
-                                    +
+                                    TIMEOUT
                                 </button>
-                                )}
-                            </div>
+                            )}
                         </div>
                     </div>
 
@@ -872,7 +1109,7 @@ function LiveGameContent({ gameId }) {
                                 </button>
                                 <button
                                     className="btn btn-primary"
-                                    onClick={() => {
+                                    onClick={async () => {
                                         setFirstHalfSnapshot({
                                             timeoutsA,
                                             timeoutsB,
@@ -888,6 +1125,12 @@ function LiveGameContent({ gameId }) {
                                         setActionLog([]);
                                         setShowHalfConfirm(false);
                                         showToast("1st half completed. Now in 2nd half.", "success");
+                                        apiPut(`/api/games/${gameId}`, {
+                                            firstHalfCompleted: true,
+                                            currentHalf: "2nd",
+                                            halfOneScoreA: teamAScore,
+                                            halfOneScoreB: teamBScore,
+                                        }).catch(() => {});
                                     }}
                                 >
                                     Yes, Start 2nd Half
@@ -917,12 +1160,16 @@ function LiveGameContent({ gameId }) {
                                     setShowSackPage(true);
                                 } else if (action.action === "Run") {
                                     setShowRunPage(true);
-                                } else {
-                                    recordAction(action.action);
                                 }
                             }}
                         >
-                            <img src={action.icon} alt={action.label} />
+                            <div className="icon-wrap">
+                                <img
+                                    src={action.icon}
+                                    alt={action.label}
+                                    style={action.action === "Fumble" ? { width: 90, height: 60, objectFit: "contain" } : undefined}
+                                />
+                            </div>
                             <h6>{action.label}</h6>
                         </div>
                     ))}
@@ -933,10 +1180,10 @@ function LiveGameContent({ gameId }) {
                 {displayActionLog.length > 0 && (
                     <div style={{ width: "100%", marginTop: 15 }}>
                         <h6 style={{ fontSize: 14, marginBottom: 8, color: "#b0b0b0", fontFamily: "'DM Sans', sans-serif" }}>
-                            Recent Actions {isViewOnly ? "(1st Half)" : ""}
+                            Recent Actions ({displayActionLog.length}){(firstHalfCompleted || isGameFinished) ? ` — ${viewingHalf} Half` : ""}
                         </h6>
                         <div style={{ maxHeight: 220, overflowY: "auto" }}>
-                            {displayActionLog.slice(0, 10).map((log, i) => {
+                            {displayActionLog.map((log, i) => {
                                 const d = log.data || {};
                                 const typeColors = {
                                     Completion: { bg: "rgba(34,197,94,0.15)", color: "#22c55e" },
@@ -1047,13 +1294,10 @@ function LiveGameContent({ gameId }) {
                 <BottomFooter
                     onCancel={() => setShowCancelConfirm(true)}
                     onForfeit={() => setShowForfeitConfirm(true)}
-                    onComplete={() => {
-                        if (isPaused) {
-                            setIsPaused(false);
-                            showToast("Game resumed", "success");
-                        } else {
-                            setShowCompleteConfirm(true);
-                        }
+                    onComplete={() => setShowCompleteConfirm(true)}
+                    onResume={() => {
+                        setIsPaused(false);
+                        showToast("Game resumed", "success");
                     }}
                     onReset={handleReset}
                     isPaused={isPaused}
@@ -1084,7 +1328,8 @@ function LiveGameContent({ gameId }) {
                     </div>
                 )}
 
-                {/* Forfeit Game Confirmation */}
+                {/* Forfeit Game Confirmation — "Yes, Forfeit" only moves to the
+                    No Stats Game question below; it doesn't apply anything yet. */}
                 {showForfeitConfirm && (
                     <div className="confirm-overlay" onClick={() => setShowForfeitConfirm(false)}>
                         <div className="confirm-box" onClick={e => e.stopPropagation()}>
@@ -1097,20 +1342,116 @@ function LiveGameContent({ gameId }) {
                             </p>
                             <div className="confirm-actions">
                                 <button className="btn btn-secondary" onClick={() => setShowForfeitConfirm(false)}>No, Go Back</button>
-                                <button className="btn btn-danger" onClick={async () => {
-                                    try {
-                                        await apiPut(`/api/games/${gameId}`, {
-                                            status: "completed",
-                                            "teamA.score": activeTeam === "A" ? 0 : 6,
-                                            "teamB.score": activeTeam === "B" ? 0 : 6,
-                                        });
-                                        showToast("Game forfeited and completed", "success");
-                                        setShowForfeitConfirm(false);
-                                        router.push("/matches");
-                                    } catch (err) {
-                                        showToast(err.message, "error");
-                                    }
+                                <button className="btn btn-danger" onClick={() => {
+                                    setShowForfeitConfirm(false);
+                                    setShowNoStatsPrompt(true);
                                 }}>Yes, Forfeit</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* No Stats Game — decides how the forfeit actually gets
+                    recorded. "No" applies it immediately (0-6, no plays
+                    logged, standings update from the score alone). */}
+                {showNoStatsPrompt && (
+                    <div className="confirm-overlay" onClick={() => { if (!forfeiting) setShowNoStatsPrompt(false); }}>
+                        <div className="confirm-box" onClick={e => e.stopPropagation()}>
+                            <h4 style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 700, fontSize: 19 }}>Schedule a No Stats Game?</h4>
+                            <p className="confirm-detail">
+                                Choose <strong>Yes</strong> to bring in a stand-in team so the real opponent can still play out the game and rack up stats. Choose <strong>No</strong> to record the forfeit result immediately instead — no plays logged, the score updates right away and standings reflect the winner.
+                            </p>
+                            <div className="confirm-actions">
+                                <button
+                                    className="btn btn-secondary"
+                                    disabled={forfeiting}
+                                    onClick={() => {
+                                        setShowNoStatsPrompt(false);
+                                        setShowSubstituteChoice(true);
+                                    }}
+                                >
+                                    Yes
+                                </button>
+                                <button
+                                    className="btn btn-danger"
+                                    disabled={forfeiting}
+                                    onClick={async () => {
+                                        setForfeiting(true);
+                                        try {
+                                            await apiPut(`/api/games/${gameId}`, {
+                                                status: "completed",
+                                                "teamA.score": activeTeam === "A" ? 0 : 6,
+                                                "teamB.score": activeTeam === "B" ? 0 : 6,
+                                            });
+                                            showToast("Game forfeited and completed", "success");
+                                            setShowNoStatsPrompt(false);
+                                            router.push("/matches");
+                                        } catch (err) {
+                                            showToast(err.message, "error");
+                                        } finally {
+                                            setForfeiting(false);
+                                        }
+                                    }}
+                                >
+                                    {forfeiting ? "Recording..." : "No"}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Substitute choice — pick how the No Stats Game gets filled */}
+                {showSubstituteChoice && (
+                    <div className="confirm-overlay" onClick={closeSubstituteFlow}>
+                        <div className="confirm-box" onClick={e => e.stopPropagation()}>
+                            <h4 style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 700, fontSize: 19 }}>
+                                How should the No Stats Game be filled?
+                            </h4>
+                            <p className="confirm-detail">
+                                {forfeitedSideTeam.name} didn&apos;t show up. Replace them with a real team so{" "}
+                                {activeTeam === "A" ? game?.teamB?.name : game?.teamA?.name} can still get game reps, or use a NO STATS placeholder.
+                            </p>
+                            <div className="confirm-actions" style={{ flexDirection: "column" }}>
+                                <button className="btn btn-primary" onClick={openTeamPicker}>Select a Team</button>
+                                <button className="btn btn-secondary" onClick={applyNoStatsPlaceholder}>NO STATS Placeholder</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Team picker — replaces the forfeiting side with the chosen team */}
+                {showTeamPicker && (
+                    <div className="confirm-overlay" onClick={() => { if (!applyingSubstitute) closeSubstituteFlow(); }}>
+                        <div className="confirm-box" onClick={e => e.stopPropagation()}>
+                            <h4 style={{ fontFamily: "'DM Sans', sans-serif", fontWeight: 700, fontSize: 19 }}>Select a Team</h4>
+                            <p className="confirm-detail">
+                                {forfeitedSideTeam.name} will be replaced by the team you pick below for this game only.{" "}
+                                {activeTeam === "A" ? game?.teamB?.name : game?.teamA?.name}&apos;s stats will count normally; the stand-in&apos;s plays are recorded but ignored.
+                            </p>
+                            {loadingLeagueTeams ? (
+                                <p className="confirm-detail">Loading teams...</p>
+                            ) : (
+                                <div className="form-group" style={{ textAlign: "left" }}>
+                                    <select
+                                        className="form-control select-form-control"
+                                        value={selectedSubTeamId}
+                                        onChange={(e) => setSelectedSubTeamId(e.target.value)}
+                                        disabled={applyingSubstitute}
+                                    >
+                                        <option value="">
+                                            {availableSubTeams.length === 0 ? "No other teams in this league" : "Select a team..."}
+                                        </option>
+                                        {availableSubTeams.map((t) => (
+                                            <option key={t._id} value={t._id}>{t.name}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                            )}
+                            <div className="confirm-actions">
+                                <button className="btn btn-secondary" onClick={closeSubstituteFlow} disabled={applyingSubstitute}>Cancel</button>
+                                <button className="btn btn-primary" onClick={applySubstituteTeam} disabled={applyingSubstitute || !selectedSubTeamId}>
+                                    {applyingSubstitute ? "Starting..." : "Start No Stats Game"}
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -1127,7 +1468,19 @@ function LiveGameContent({ gameId }) {
                                 <button className="btn btn-secondary" onClick={() => setShowCompleteConfirm(false)}>No, Go Back</button>
                                 <button className="btn btn-primary" onClick={async () => {
                                     try {
-                                        await apiPut(`/api/games/${gameId}`, { status: "completed" });
+                                        const payload = { status: "completed" };
+                                        // No Stats Game wrap-up: restore the real (forfeiting) team's
+                                        // name here and force its score to 0 — the stand-in's own
+                                        // score never counts, whatever it actually was.
+                                        if (game?.noStatsSide && game?.noStatsOriginalTeam?.name) {
+                                            const side = game.noStatsSide;
+                                            payload[side === "A" ? "teamA" : "teamB"] = {
+                                                name: game.noStatsOriginalTeam.name,
+                                                logo: game.noStatsOriginalTeam.logo || "",
+                                                score: 0,
+                                            };
+                                        }
+                                        await apiPut(`/api/games/${gameId}`, payload);
                                         showToast("Game completed!", "success");
                                         setShowCompleteConfirm(false);
                                         router.push("/matches");
